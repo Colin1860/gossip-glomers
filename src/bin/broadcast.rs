@@ -1,6 +1,5 @@
 use anyhow::Context;
 use maelstrom_convenience::{main_loop, Body, Event, Message, Node};
-use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -139,20 +138,6 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                         }
                         .send(&mut *output)
                         .with_context(|| format!("gossip to {}", n))?;
-
-                        // if !notify_of.is_empty() {
-                        //     Message {
-                        //         src: self.node.clone(),
-                        //         dst: String::from(n),
-                        //         body: Body {
-                        //             id: None,
-                        //             in_reply_to: None,
-                        //             payload: Payload::Gossip { seen: notify_of },
-                        //         },
-                        //     }
-                        //     .send(&mut *output)
-                        //     .with_context(|| format!("gossip to {}", n))?;
-                        // }
                     }
                 }
             },
