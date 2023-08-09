@@ -44,7 +44,9 @@ enum InjectedPayload {
 
 struct CounterNode {
     counter: u64,
-    tmp_counter: u64,
+    acc_delta: u64,
+    last_expected: u64,
+    last_acc_delta: u64,
     id: usize,
     node_id: String,
     sync: std::sync::mpsc::Sender<()>,
@@ -71,6 +73,13 @@ impl CounterNode {
         reply.dst = SEQ_KV.into();
         reply.send(output).context("sending broke")
     }
+
+    fn calc_expected(&mut self) -> u64 {
+        let expected = self.counter + self.acc_delta;
+        self.last_expected = expected;
+        expected
+    }
+
 }
 
 impl Node<(), Payload, InjectedPayload> for CounterNode {
@@ -111,7 +120,9 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
             id: 1,
             node_id: init.node_id,
             counter: 0,
-            tmp_counter: 0,
+            acc_delta: 0,
+            last_acc_delta: 0,
+            last_expected: 0,
             sync: tx,
         })
     }
@@ -145,16 +156,25 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
                         }
                     }
                     Payload::Add { delta } => {
-                        self.tmp_counter += delta;
+                        self.acc_delta += delta;
+                        self.calc_expected();
                         payload = Some(Payload::AddOk {})
                     }
                     Payload::AddOk {} => {}
+                    Payload::CasOk {} => {
+                        self.acc_delta = self.acc_delta - self.last_acc_delta;
+                    }
                     Payload::Read { .. } => {
                         payload = Some(Payload::ReadOk {
                             value: self.counter,
                         })
                     }
-                    Payload::ReadOk { value } => self.counter = value,
+                    Payload::ReadOk { value } => {
+                        self.counter = value;
+                        if self.counter == self.last_expected {
+                            self.acc_delta = 0;
+                        }
+                    },
                     // the rest are messages to the seq-kv
                     _ => {}
                 }
@@ -167,11 +187,12 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
             Event::Injected(message) => {
                 match message {
                     InjectedPayload::SendCas => {
-                        if self.counter != self.tmp_counter {
+                        self.last_acc_delta = self.acc_delta;
+                        if self.counter < self.last_expected {
                             let cas_payload = Payload::Cas {
                                 key: KEY.into(),
                                 from: self.counter,
-                                to: self.tmp_counter,
+                                to: self.last_expected,
                                 create_if_not_exists: true,
                             };
 
