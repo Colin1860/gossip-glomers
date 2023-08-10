@@ -1,4 +1,10 @@
-use std::{io::StdoutLock, time::Duration};
+use std::{
+    collections::{HashMap},
+    io::StdoutLock,
+    time::Duration,
+};
+
+use rand::Rng;
 
 use anyhow::Context;
 use maelstrom_convenience::{main_loop, Body, Event, Message, Node};
@@ -6,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 const KEY: &str = "counter";
 const SEQ_KV: &str = "seq-kv";
+const MAGIC: usize = 1860;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -39,16 +46,15 @@ enum Payload {
 #[serde(rename_all = "snake_case")]
 enum InjectedPayload {
     SendCas,
-    SendRead,
+    Discover,
 }
 
 struct CounterNode {
-    counter: u64,
+    total_counter: u64,
     acc_delta: u64,
-    last_expected: u64,
-    last_acc_delta: u64,
     id: usize,
     node_id: String,
+    neighbors: HashMap<String, u64>,
     sync: std::sync::mpsc::Sender<()>,
 }
 
@@ -74,12 +80,13 @@ impl CounterNode {
         reply.send(output).context("sending broke")
     }
 
-    fn calc_expected(&mut self) -> u64 {
-        let expected = self.counter + self.acc_delta;
-        self.last_expected = expected;
-        expected
+    fn calc(&mut self) -> u64 {
+        let mut counter = self.acc_delta;
+        for (_k, v) in &self.neighbors {
+            counter += *v;
+        }
+        counter
     }
-
 }
 
 impl Node<(), Payload, InjectedPayload> for CounterNode {
@@ -94,35 +101,39 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
         let (tx, rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
-            // generate gossip events
-            let mut loop_count = 0;
+            // give each node a slightly different delay
+            let mut rng = rand::thread_rng();
+            let num = rng.gen_range(0..3) as u64;
+            std::thread::sleep(Duration::from_millis(100*num));
             loop {
                 // This should read on EOF
                 if let Ok(_) = rx.try_recv() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(200));
-                loop_count += 1;
-                if let Err(_) = inject.send(Event::Injected(InjectedPayload::SendCas)) {
+                std::thread::sleep(Duration::from_millis(800));
+                if let Err(_) = inject.send(Event::Injected(InjectedPayload::Discover)) {
                     break;
                 }
 
-                if loop_count == 5 {
-                    loop_count = 0;
-                    if let Err(_) = inject.send(Event::Injected(InjectedPayload::SendRead)) {
-                        break;
-                    }
+                std::thread::sleep(Duration::from_millis(200));
+
+                if let Err(_) = inject.send(Event::Injected(InjectedPayload::SendCas)) {
+                    break;
                 }
             }
         });
 
         Ok(CounterNode {
             id: 1,
+            neighbors: init
+                .node_ids
+                .into_iter()
+                .filter(|id| *id != init.node_id)
+                .map(|id| (id, 0 as u64))
+                .collect(),
             node_id: init.node_id,
-            counter: 0,
+            total_counter: 0,
             acc_delta: 0,
-            last_acc_delta: 0,
-            last_expected: 0,
             sync: tx,
         })
     }
@@ -132,8 +143,11 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
         input: Event<Payload, InjectedPayload>,
         output: &mut std::io::StdoutLock,
     ) -> anyhow::Result<()> {
+        eprintln!("Reading input");
         match input {
             Event::Message(message) => {
+                let id = message.body.id;
+                let from = message.src.clone();
                 let mut reply = message.into_reply(Some(&mut self.id));
                 let mut payload = None;
                 match reply.body.payload {
@@ -157,24 +171,29 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
                     }
                     Payload::Add { delta } => {
                         self.acc_delta += delta;
-                        self.calc_expected();
                         payload = Some(Payload::AddOk {})
                     }
                     Payload::AddOk {} => {}
                     Payload::CasOk {} => {
-                        self.acc_delta = self.acc_delta - self.last_acc_delta;
+                        self.total_counter = self.calc();
                     }
                     Payload::Read { .. } => {
+                        let which_counter = if let Some(MAGIC) = id {
+                            self.acc_delta
+                        } else {
+                            self.total_counter
+                        };
                         payload = Some(Payload::ReadOk {
-                            value: self.counter,
+                            value: which_counter,
                         })
                     }
                     Payload::ReadOk { value } => {
-                        self.counter = value;
-                        if self.counter == self.last_expected {
-                            self.acc_delta = 0;
+                        if from == SEQ_KV {
+                            self.total_counter = value;
+                        } else {
+                            *self.neighbors.entry(from.clone()).or_insert(0) = value;
                         }
-                    },
+                    }
                     // the rest are messages to the seq-kv
                     _ => {}
                 }
@@ -187,41 +206,40 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
             Event::Injected(message) => {
                 match message {
                     InjectedPayload::SendCas => {
-                        self.last_acc_delta = self.acc_delta;
-                        if self.counter < self.last_expected {
-                            let cas_payload = Payload::Cas {
-                                key: KEY.into(),
-                                from: self.counter,
-                                to: self.last_expected,
-                                create_if_not_exists: true,
-                            };
-
-                            let m = Message {
-                                src: self.node_id.clone(),
-                                dst: SEQ_KV.into(),
-                                body: Body {
-                                    id: None,
-                                    in_reply_to: None,
-                                    payload: cas_payload,
-                                },
-                            };
-                            m.send(output)?
-                        }
-                    }
-                    InjectedPayload::SendRead => {
-                        let read_payload = Payload::Read {
-                            key: Some(KEY.into()),
+                        let new_counter = self.calc();
+                        let cas_payload = Payload::Cas {
+                            key: KEY.into(),
+                            from: self.total_counter,
+                            to: new_counter,
+                            create_if_not_exists: true,
                         };
+
                         let m = Message {
                             src: self.node_id.clone(),
                             dst: SEQ_KV.into(),
                             body: Body {
                                 id: None,
                                 in_reply_to: None,
-                                payload: read_payload,
+                                payload: cas_payload,
                             },
                         };
                         m.send(output)?
+                    }
+                    InjectedPayload::Discover => {
+                        for (key, _) in &self.neighbors {
+                            let read_payload = Payload::Read { key: None };
+                            let m = Message {
+                                src: self.node_id.clone(),
+                                dst: key.clone(),
+                                body: Body {
+                                    id: Some(MAGIC),
+                                    in_reply_to: None,
+                                    payload: read_payload,
+                                },
+                            };
+
+                            m.send(output)?
+                        }
                     }
                 }
                 Ok(())
