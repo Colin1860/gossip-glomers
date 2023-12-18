@@ -1,0 +1,159 @@
+INFO - Became candidate for term: 1
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 1
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 1
+INFO - Cleared earlier votes
+INFO - Already voted for n0; not granting vote.
+INFO - Already voted for n2; not granting vote.
+INFO - Became candidate for term: 2
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 2
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 2 higher than our term 1
+INFO - Became follower for term: 2
+INFO - Granting vote to n2
+INFO - Became leader for term: 2
+INFO - Became candidate for term: 3
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 4
+INFO - Cleared earlier votes
+INFO - Stepping down: haven't received any acks lately
+INFO - Became follower for term: 2
+INFO - Became candidate for term: 3
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 3 higher than our term 2
+INFO - Became follower for term: 3
+INFO - Granting vote to n0
+INFO - Became leader for term: 3
+INFO - Became candidate for term: 4
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 4 higher than our term 3
+INFO - Became follower for term: 4
+INFO - Granting vote to n2
+INFO - Became leader for term: 4
+INFO - Became candidate for term: 5
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 6
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 5
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 5 higher than our term 4
+INFO - Became follower for term: 5
+INFO - Granting vote to n0
+INFO - Became leader for term: 5
+INFO - Became candidate for term: 7
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 8
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 6
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 6 higher than our term 5
+INFO - Became follower for term: 6
+INFO - Granting vote to n2
+INFO - Became leader for term: 6
+INFO - Became candidate for term: 7
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 7 higher than our term 6
+INFO - Became follower for term: 7
+INFO - Granting vote to n0
+INFO - Became leader for term: 7
+INFO - Became candidate for term: 8
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 8 higher than our term 7
+INFO - Became follower for term: 8
+INFO - Granting vote to n2
+INFO - Became leader for term: 8
+INFO - Became candidate for term: 9
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 10
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 11
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 12
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 9
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 9 higher than our term 8
+INFO - Became follower for term: 9
+INFO - Granting vote to n0
+INFO - Became leader for term: 9
+INFO - Became candidate for term: 13
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 10
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 10 higher than our term 9
+INFO - Became follower for term: 10
+INFO - Granting vote to n2
+INFO - Became leader for term: 10
+INFO - Became candidate for term: 14
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 11
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 11 higher than our term 10
+INFO - Became follower for term: 11
+INFO - Granting vote to n0
+INFO - Became leader for term: 11
+INFO - Became candidate for term: 12
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 12 higher than our term 11
+INFO - Became follower for term: 12
+INFO - Granting vote to n2
+INFO - Became leader for term: 12
+INFO - Became candidate for term: 15
+INFO - Cleared earlier votes
+INFO - Became candidate for term: 13
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 13 higher than our term 12
+INFO - Became follower for term: 13
+INFO - Granting vote to n0
+INFO - Became leader for term: 13
+INFO - Candidate term 13 lower than 15, not gran
+                    ting vote.
+INFO - Stepping down: remote term 15 higher than our term 13
+INFO - Became follower for term: 15
+INFO - Became candidate for term: 16
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 16 higher than our term 13
+INFO - Became follower for term: 16
+INFO - Granting vote to n1
+INFO - Became leader for term: 16
+INFO - Stepping down: remote term 16 higher than our term 15
+INFO - Became follower for term: 16
+INFO - Granting vote to n1
+INFO - Became candidate for term: 17
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 17 higher than our term 16
+INFO - Became follower for term: 17
+INFO - Granting vote to n0
+INFO - Stepping down: remote term 17 higher than our term 16
+INFO - Became follower for term: 17
+INFO - Granting vote to n0
+INFO - Became leader for term: 17
+INFO - Became candidate for term: 18
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 18 higher than our term 17
+INFO - Became follower for term: 18
+INFO - Granting vote to n1
+INFO - Stepping down: remote term 18 higher than our term 17
+INFO - Became follower for term: 18
+INFO - Granting vote to n1
+INFO - Became leader for term: 18
+INFO - Became candidate for term: 19
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 19 higher than our term 18
+INFO - Became follower for term: 19
+INFO - Granting vote to n2
+INFO - Stepping down: remote term 19 higher than our term 18
+INFO - Became follower for term: 19
+INFO - Granting vote to n2
+INFO - Became leader for term: 19
+INFO - Became candidate for term: 20
+INFO - Cleared earlier votes
+INFO - Stepping down: remote term 20 higher than our term 19
+INFO - Became follower for term: 20
+INFO - Granting vote to n0
+INFO - Stepping down: remote term 20 higher than our term 19
+INFO - Became follower for term: 20
+INFO - Granting vote to n0
+INFO - Became leader for term: 20

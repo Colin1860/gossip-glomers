@@ -1,7 +1,8 @@
+pub mod raft;
+
 use anyhow::Context;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{BufRead, StdoutLock, Write};
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message<Payload> {
     pub src: String,
