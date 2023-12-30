@@ -4,12 +4,6 @@ use anyhow::Context;
 use maelstrom_convenience::{main_loop, Event, Message, Node};
 use serde::{Deserialize, Serialize};
 
-const KV: &str = "lin-kv";
-const LATEST: &str = "latest_";
-const ENTRY: &str = "entry_";
-const COMMIT: &str = "commit_";
-
-
 pub struct Storage {
     logs: HashMap<String, Log>,
 }
