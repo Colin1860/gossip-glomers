@@ -19,28 +19,17 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::StdoutLock,
     thread,
     time::{Duration, Instant},
 };
 
+const READ: &str = "r";
+const WRITE: &str = "w";
 const NANO: f32 = 1_000_000_000.0;
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-pub enum Command {
-    Cas { key: u32, from: u32, to: u32 },
-    Read { key: u32 },
-    Write { key: u32, value: u32 },
-}
-
-struct KvError(u32, &'static str);
-
-impl KvError {
-    const KEY_NOT_PRESENT: KvError = KvError(20, "Key does not exist");
-    const PRECONDITION_FAILED: KvError = KvError(22, "Precondition failed");
-    const TEMPORARILY_UNAVAILABLE: KvError = KvError(11, "in election process, unavailable");
-}
+pub type Command = (String, u32, Option<u32>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -50,23 +39,12 @@ enum Payload {
         code: u64,
         text: String,
     },
-    Read {
-        key: u32,
+    Txn {
+        txn: Vec<Command>,
     },
-    ReadOk {
-        value: u32,
+    TxnOk {
+        txn: Vec<Command>,
     },
-    Write {
-        key: u32,
-        value: u32,
-    },
-    WriteOk,
-    Cas {
-        key: u32,
-        from: u32,
-        to: u32,
-    },
-    CasOk,
     RequestVote {
         term: u32,
         candidate: String,
@@ -92,16 +70,6 @@ enum Payload {
     },
 }
 
-impl From<Command> for Payload {
-    fn from(cmd: Command) -> Self {
-        match cmd {
-            Command::Cas { key, from, to } => Payload::Cas { key, from, to },
-            Command::Read { key } => Payload::Read { key },
-            Command::Write { key, value } => Payload::Write { key, value },
-        }
-    }
-}
-
 enum InternalCommunication {
     RunCandidate,
     StepDown,
@@ -115,6 +83,7 @@ enum InternalCommunication {
 #[serde(rename_all = "snake_case")]
 enum InjectedPayload {
     Req,
+    Rep,
 }
 
 struct KVNode {
@@ -122,6 +91,7 @@ struct KVNode {
     node: String,
     nodes: HashSet<String>,
     store: HashMap<u32, u32>,
+    buffered: VecDeque<(String, u32, Vec<Command>)>,
     raft_data: RaftData<LogItem>,
     injector: std::sync::mpsc::Sender<maelstrom_convenience::Event<Payload, InjectedPayload>>,
     comm: crossbeam::channel::Receiver<InternalCommunication>,
@@ -180,7 +150,7 @@ impl Raft for KVNode {
     fn reset_election_deadline(&mut self) {
         let mut rng = rand::thread_rng();
         let new_timeline = Instant::now().checked_add(Duration::from_secs_f32(
-            (rng.gen_range(0.0..1.0) + 1.0) * ELECTION_TIMEOUT.as_secs_f32(),
+            rng.gen_range(0.0..ELECTION_TIMEOUT.as_secs_f32()),
         ));
         if let Some(new_timeline) = new_timeline {
             self.raft_data.election_deadline = new_timeline;
@@ -199,7 +169,6 @@ impl Raft for KVNode {
     }
 
     fn request_votes(&mut self) {
-        self.raft_data.term_vote_started = 0;
         self.raft_data.votes.clear();
         self.raft_data.votes.insert(self.node.clone());
         log::info!("{}", format!("Cleared earlier votes"));
@@ -219,7 +188,7 @@ impl Raft for KVNode {
         let mut grant = false;
         let our_term = self.get_current_term();
 
-        if remote_term < our_term {
+        if remote_term < self.get_current_term() {
             log::info!(
                 "{}",
                 format!(
@@ -263,7 +232,7 @@ impl Raft for KVNode {
             self.reset_election_deadline();
         }
 
-        (our_term, grant)
+        (self.get_current_term(), grant)
     }
 
     fn handle_vote(&mut self, from: String, remote_term: u32, granted: bool) {
@@ -393,7 +362,7 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
         thread::Builder::new()
             .name("RunCandidateThread".to_string())
             .spawn(move || loop {
-                thread::sleep(Duration::new(0, (0.1 * NANO) as u32));
+                thread::sleep(Duration::from_secs_f32(0.1));
                 let rand_sleep = rand::thread_rng().gen_range(0.0..0.1);
                 thread::sleep(Duration::new(0, (rand_sleep * NANO) as u32));
                 let _ = s1.send(InternalCommunication::RunCandidate);
@@ -402,7 +371,7 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
         thread::Builder::new()
             .name("StepDownThread".to_string())
             .spawn(move || loop {
-                thread::sleep(Duration::new(0, (0.1 * NANO) as u32));
+                thread::sleep(Duration::from_secs_f32(0.1));
                 let _ = s2.send(InternalCommunication::StepDown);
             })?;
 
@@ -442,6 +411,7 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
             store: HashMap::default(),
             comm: r,
             injector: inject.clone(),
+            buffered: VecDeque::default(),
         })
     }
 
@@ -469,77 +439,58 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                 }
             }
             Ok(InternalCommunication::Replicate) => {
-                let elapsed_time = self
-                    .raft_data
-                    .last_replication
-                    .unwrap_or(Instant::now().checked_sub(Duration::from_secs(60)).unwrap())
-                    .elapsed();
-                let mut replicated = false;
-
-                if self.state() == State::Leader && MIN_REPLICATION_INTERVAL < elapsed_time {
-                    for node in &self.nodes {
-                        let ni = *self.raft_data.next_index.get(node).unwrap();
-                        let entries = self.raft_data.log.slice_from_index(ni as usize);
-                        if !entries.is_empty() || HEARTBEAT_INTERVAL < elapsed_time {
-                            log::info!("{}", format!("Replicating {} and upwards to {}", ni, node));
-                            replicated = true;
-                            let append_payload = Payload::AppendEntries {
-                                term: self.get_current_term(),
-                                leader_id: self.node.clone(),
-                                prev_log_index: ni - 1,
-                                prev_log_term: self.raft_data.log.at(ni as usize - 1).unwrap().0,
-                                entries,
-                                leader_commit: self.raft_data.commit_index,
-                            };
-
-                            Message {
-                                src: self.node.clone(),
-                                dst: String::from(node),
-                                body: Body {
-                                    id: None,
-                                    in_reply_to: None,
-                                    payload: append_payload,
-                                },
-                            }
-                            .send(&mut *output)
-                            .with_context(|| format!("AppendEntries to {}", &node))?;
-                            log::info!("{}", format!("Sending append to {}", node));
-                        }
-                    }
-                    if replicated {
-                        self.raft_data.last_replication = Some(Instant::now());
-                    }
-                }
+                self.injector.send(Event::Injected(InjectedPayload::Rep))?;
             }
             _ => {}
         }
 
+        // check if we have unhandled txn messages in our buffer
+        while !self.buffered.is_empty() && self.are_productive() {
+            match self.buffered.pop_back() {
+                Some(unhandled) => {
+                    log::info!("{}", format!("Handling {:?} from buffer", &unhandled.2));
+                    let p = self.handle_txn(
+                        &unhandled.2,
+                        unhandled.0.clone(),
+                        Some(unhandled.1 as usize),
+                        output,
+                    )?;
+                    if let Some(payload) = p {
+                        Message {
+                            src: self.node.clone(),
+                            dst: unhandled.0,
+                            body: Body {
+                                id: Some(unhandled.1 as usize + 1),
+                                in_reply_to: Some(unhandled.1 as usize + 1),
+                                payload,
+                            },
+                        }
+                        .send(output)
+                        .with_context(|| {
+                            format!("handling buffered txn failed on sending answer")
+                        })?;
+                    }
+                }
+                None => {}
+            }
+            if self.buffered.is_empty() {
+                log::info!("Emptied internal buffer");
+            }
+        }
+
         match input {
             Event::Message(message) => {
-                let in_reply = message.body.in_reply_to;
-                if let Some(1860) = in_reply {
-                    log::info!("Received a proxy");
-                }
-                let received_id: Option<usize> = message.body.id;
-                let src = message.src.clone();
+                let id = message.body.id;
+                let from = message.src.clone();
                 let mut reply = message.into_reply(Some(&mut self.id));
+                reply.body.in_reply_to = id;
                 let new_payload = match reply.body.payload {
-                    Payload::Cas { key, from, to } => {
-                        let cmd = Command::Cas { key, from, to };
-                        self.handle_kv(cmd, src.clone(), received_id, output)?
-                    }
-                    Payload::Read { key } => {
-                        let cmd = Command::Read { key };
-                        self.handle_kv(cmd, src.clone(), received_id, output)?
-                    }
-                    Payload::Write { key, value } => {
-                        let cmd = Command::Write { key, value };
-                        self.handle_kv(cmd, src.clone(), received_id, output)?
-                    }
+                    Payload::Txn { ref txn } => self.handle_txn(txn, from, id, output)?,
                     Payload::RequestVoteOk { term, vote_granted } => {
-                        self.handle_vote(src, term, vote_granted);
+                        self.handle_vote(from, term, vote_granted);
                         None
                     }
+
                     Payload::RequestVote {
                         term,
                         ref candidate,
@@ -563,7 +514,6 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                         ref entries,
                         leader_commit,
                     } => {
-                        log::info!("Received append entries from: {}", &src);
                         let reply_payload = self.handle_append(
                             term,
                             prev_log_index,
@@ -585,11 +535,11 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                             self.reset_stepdown_deadline();
                             if success {
                                 log::info!("{}", "replication succesful");
-                                let next_index = *self.raft_data.next_index.get(&src).unwrap();
-                                let match_index = *self.raft_data.match_index.get(&src).unwrap();
-                                *self.raft_data.next_index.get_mut(&src).unwrap() =
+                                let next_index = *self.raft_data.next_index.get(&from).unwrap();
+                                let match_index = *self.raft_data.match_index.get(&from).unwrap();
+                                *self.raft_data.next_index.get_mut(&from).unwrap() =
                                     u32::max(next_index, index_plus_commited);
-                                *self.raft_data.match_index.get_mut(&src).unwrap() =
+                                *self.raft_data.match_index.get_mut(&from).unwrap() =
                                     u32::max(match_index, index_plus_commited - 1);
                                 log::info!(
                                     "{}",
@@ -597,7 +547,7 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                                 );
                                 self.advance_commit_index();
                             } else {
-                                *self.raft_data.next_index.get_mut(&src).unwrap() -= 1;
+                                *self.raft_data.next_index.get_mut(&from).unwrap() -= 1;
                             }
                         }
                         None
@@ -621,6 +571,56 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                     self.raft_data.term_vote_started = term;
                     self.broadcast(payload, output)?
                 }
+                InjectedPayload::Rep => {
+                    let elapsed_time = self
+                        .raft_data
+                        .last_replication
+                        .unwrap_or(Instant::now().checked_sub(Duration::from_secs(60)).unwrap())
+                        .elapsed();
+                    let mut replicated = false;
+
+                    if self.state() == State::Leader && MIN_REPLICATION_INTERVAL < elapsed_time {
+                        for node in &self.nodes {
+                            let ni = *self.raft_data.next_index.get(node).unwrap();
+                            let entries = self.raft_data.log.slice_from_index(ni as usize);
+                            if !entries.is_empty() || HEARTBEAT_INTERVAL < elapsed_time {
+                                log::info!(
+                                    "{}",
+                                    format!("Replicating {} and upwards to {}", ni, node)
+                                );
+                                replicated = true;
+                                let append_payload = Payload::AppendEntries {
+                                    term: self.get_current_term(),
+                                    leader_id: self.node.clone(),
+                                    prev_log_index: ni - 1,
+                                    prev_log_term: self
+                                        .raft_data
+                                        .log
+                                        .at(ni as usize - 1)
+                                        .unwrap()
+                                        .0,
+                                    entries,
+                                    leader_commit: self.raft_data.commit_index,
+                                };
+
+                                Message {
+                                    src: self.node.clone(),
+                                    dst: String::from(node),
+                                    body: Body {
+                                        id: None,
+                                        in_reply_to: None,
+                                        payload: append_payload,
+                                    },
+                                }
+                                .send(&mut *output)
+                                .with_context(|| format!("AppendEntries to {}", node))?;
+                            }
+                        }
+                        if replicated {
+                            self.raft_data.last_replication = Some(Instant::now());
+                        }
+                    }
+                }
             },
             Event::EOF => {}
         }
@@ -630,25 +630,27 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
 }
 
 impl KVNode {
-    fn handle_kv(
+    fn handle_txn(
         &mut self,
-        kv_cmd: Command,
+        txn: &Vec<(String, u32, Option<u32>)>,
         from: String,
         id: Option<usize>,
         output: &mut StdoutLock,
     ) -> anyhow::Result<Option<Payload>> {
         if self.state() == State::Leader {
-            let p = self.handle_op(kv_cmd);
-            let log_item = LogItem {
-                from: from.clone(),
-                msg_id: id.unwrap_or(0) as u32,
-                cmd: kv_cmd.clone(),
-            };
-            self.raft_data
-                .log
-                .append(self.get_current_term(), Some(log_item));
-
-            Ok(Some(p))
+            let mut answer = Vec::with_capacity(txn.capacity());
+            for cmd in txn {
+                self.handle_command(cmd, &mut answer);
+                let log_item = LogItem {
+                    from: from.clone(),
+                    msg_id: id.unwrap_or(0) as u32,
+                    cmd: cmd.clone(),
+                };
+                self.raft_data
+                    .log
+                    .append(self.get_current_term(), Some(log_item));
+            }
+            Ok(Some(Payload::TxnOk { txn: answer }))
         } else if self.raft_data.presumed_leader.is_some() {
             // proxy to presumed leader
             Message {
@@ -656,28 +658,24 @@ impl KVNode {
                 dst: self.raft_data.presumed_leader.as_ref().unwrap().clone(),
                 body: Body {
                     id,
-                    in_reply_to: Some(1860),
-                    payload: Payload::from(kv_cmd),
+                    in_reply_to: None,
+                    payload: Payload::Txn { txn: txn.clone() },
                 },
             }
             .send(output)
             .with_context(|| format!("Proxy to failed"))?;
-            log::info!("{}", format!("Proxied to leader: {}", self.raft_data.presumed_leader.as_ref().unwrap()));
             Ok(None)
         } else {
             log::info!(
                 "{}",
                 format!(
                     "In leader election process; putting message in local queue: {:?}",
-                    kv_cmd.clone()
+                    txn.clone()
                 )
             );
-            // self.buffered
-            //     .push_front((from.clone(), id.unwrap() as u32, kv_cmd.clone()));
-            Ok(Some(Payload::Error {
-                code: KvError::TEMPORARILY_UNAVAILABLE.0 as u64,
-                text: KvError::TEMPORARILY_UNAVAILABLE.1.into(),
-            }))
+            self.buffered
+                .push_front((from.clone(), id.unwrap() as u32, txn.clone()));
+            Ok(None)
         }
     }
 
@@ -689,8 +687,7 @@ impl KVNode {
                 .log
                 .at(self.raft_data.last_applied as usize)
                 .unwrap();
-            // we are not leading, so we just catch up not responding. thats why we ditch the return value
-            let _ = self.apply(cmd.1.unwrap().cmd);
+            self.apply(&cmd.1.unwrap().cmd);
         }
     }
 
@@ -700,19 +697,6 @@ impl KVNode {
 
     fn read(&self, index: u32) -> Option<u32> {
         self.store.get(&index).map(|x| *x)
-    }
-
-    fn cas(&mut self, index: u32, from: u32, to: u32) -> Option<KvError> {
-        if let Some(cur) = self.store.get_mut(&index) {
-            if *cur == from {
-                *cur = to;
-                return None;
-            } else {
-                Some(KvError::PRECONDITION_FAILED)
-            }
-        } else {
-            Some(KvError::KEY_NOT_PRESENT)
-        }
     }
 
     fn broadcast(&self, payload: Payload, output: &mut StdoutLock) -> anyhow::Result<()> {
@@ -732,31 +716,27 @@ impl KVNode {
         Ok(())
     }
 
-    fn handle_op(&mut self, cmd: Command) -> Payload {
-        self.apply(cmd)
+    fn handle_command(&mut self, cmd: &Command, answer: &mut Vec<Command>) {
+        let mut add = |s, index, val| answer.push((s, index, val));
+        let cmd = self.apply(cmd);
+        add(cmd.0, cmd.1, cmd.2);
     }
 
-    fn apply(&mut self, cmd: Command) -> Payload {
-        match cmd {
-            Command::Read { key } => self.read(key).map_or(
-                Payload::Error {
-                    code: KvError::KEY_NOT_PRESENT.0 as u64,
-                    text: KvError::KEY_NOT_PRESENT.1.into(),
-                },
-                |val| Payload::ReadOk { value: val },
-            ),
-            Command::Write { key, value: to } => {
-                let _ = self.write(key, to);
-                Payload::WriteOk
+    fn apply(&mut self, cmd: &Command) -> (String, u32, Option<u32>) {
+        let mut res = (String::new(), 0, None);
+        match cmd.0.as_str() {
+            READ => res = (String::from(READ), cmd.1, self.read(cmd.1)),
+            WRITE => {
+                self.write(cmd.1, cmd.2.unwrap());
+                res = (String::from(WRITE), cmd.1, cmd.2)
             }
-            Command::Cas { key, from, to } => {
-                self.cas(key, from, to)
-                    .map_or(Payload::CasOk, |e| Payload::Error {
-                        code: e.0 as u64,
-                        text: e.1.into(),
-                    })
-            }
+            _ => {}
         }
+        res
+    }
+
+    fn are_productive(&self) -> bool {
+        self.state() == State::Leader || self.raft_data.presumed_leader.is_some()
     }
 
     fn set_payload_and_send(
@@ -775,7 +755,7 @@ pub fn median<T: Ord + Copy>(mut c: Vec<T>) -> Option<T> {
 }
 
 pub fn majority(number_of_nodes: usize) -> usize {
-    ((number_of_nodes as f32 / 2.0).floor() as usize) + 1
+    ((number_of_nodes as f64 / 2.0).floor() as usize) + 1
 }
 
 fn main() -> anyhow::Result<()> {

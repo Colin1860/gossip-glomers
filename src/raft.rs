@@ -113,11 +113,11 @@ pub trait Raft: Stateful {
         self.reset_presumed_leader();
         self.reset_election_deadline();
         self.reset_stepdown_deadline();
+        self.request_votes();
         log::info!(
             "{}",
             format!("Became candidate for term: {}", self.get_current_term())
         );
-        self.request_votes();
     }
 
     fn become_leader(&mut self) {
