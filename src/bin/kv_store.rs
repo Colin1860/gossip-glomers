@@ -147,10 +147,10 @@ impl Stateful for KVNode {
 }
 
 impl Raft for KVNode {
-    type Item = LogItem;
-    type Data = Payload;
+    type LogItem = LogItem;
+    type Packet = Payload;
 
-    fn advance_commit_index(&mut self) {
+    fn advance_commit_index(&mut self) -> Vec<(String, u32, Payload)> {
         if self.state() == State::Leader {
             let med = median(self.raft_data.match_index.values().copied().collect()).unwrap_or(0);
 
@@ -164,7 +164,7 @@ impl Raft for KVNode {
                 _ => {}
             }
         }
-        self.advance_map_from_log();
+        self.advance_map_from_log()
     }
 
     // #[inline(always)]
@@ -313,7 +313,7 @@ impl Raft for KVNode {
         prev_log_term: u32,
         entries: &Vec<(u32, Option<LogItem>)>,
         leader_commit: u32,
-    ) -> Self::Data {
+    ) -> Self::Packet {
         self.maybe_step_down(term);
         let current_term = self.get_current_term();
         let index_plus_commited = prev_log_index + 1 + entries.len() as u32;
@@ -503,7 +503,6 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                             }
                             .send(&mut *output)
                             .with_context(|| format!("AppendEntries to {}", &node))?;
-                            log::info!("{}", format!("Sending append to {}", node));
                         }
                     }
                     if replicated {
@@ -516,28 +515,24 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
 
         match input {
             Event::Message(message) => {
-                let in_reply = message.body.in_reply_to;
-                if let Some(1860) = in_reply {
-                    log::info!("Received a proxy");
-                }
                 let received_id: Option<usize> = message.body.id;
                 let src = message.src.clone();
                 let mut reply = message.into_reply(Some(&mut self.id));
                 let new_payload = match reply.body.payload {
                     Payload::Cas { key, from, to } => {
                         let cmd = Command::Cas { key, from, to };
-                        self.handle_kv(cmd, src.clone(), received_id, output)?
+                        self.handle_kv(cmd, src.to_string(), received_id, output)?
                     }
                     Payload::Read { key } => {
                         let cmd = Command::Read { key };
-                        self.handle_kv(cmd, src.clone(), received_id, output)?
+                        self.handle_kv(cmd, src.to_string(), received_id, output)?
                     }
                     Payload::Write { key, value } => {
                         let cmd = Command::Write { key, value };
-                        self.handle_kv(cmd, src.clone(), received_id, output)?
+                        self.handle_kv(cmd, src.to_string(), received_id, output)?
                     }
                     Payload::RequestVoteOk { term, vote_granted } => {
-                        self.handle_vote(src, term, vote_granted);
+                        self.handle_vote(src.to_string(), term, vote_granted);
                         None
                     }
                     Payload::RequestVote {
@@ -563,7 +558,6 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                         ref entries,
                         leader_commit,
                     } => {
-                        log::info!("Received append entries from: {}", &src);
                         let reply_payload = self.handle_append(
                             term,
                             prev_log_index,
@@ -595,7 +589,26 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                                     "{}",
                                     format!("Next index: {:?}", self.raft_data.next_index)
                                 );
-                                self.advance_commit_index();
+                                let to_reply = self.advance_commit_index();
+                                log::info!(
+                                    "{}",
+                                    format!("Size of reply collection: {}", to_reply.len())
+                                );
+                                to_reply.into_iter().for_each(|(to, in_reply_to, p)| {
+                                    Message {
+                                        src: self.node.clone(),
+                                        dst: to,
+                                        body: Body {
+                                            id: Some(self.id),
+                                            in_reply_to: Some(in_reply_to as usize),
+                                            payload: p,
+                                        },
+                                    }
+                                    .send(output)
+                                    .with_context(|| format!("Reply from log failed"))
+                                    .expect("Replying in closure for each failed");
+                                    self.id += 1;
+                                })
                             } else {
                                 *self.raft_data.next_index.get_mut(&src).unwrap() -= 1;
                             }
@@ -638,7 +651,6 @@ impl KVNode {
         output: &mut StdoutLock,
     ) -> anyhow::Result<Option<Payload>> {
         if self.state() == State::Leader {
-            let p = self.handle_op(kv_cmd);
             let log_item = LogItem {
                 from: from.clone(),
                 msg_id: id.unwrap_or(0) as u32,
@@ -648,7 +660,7 @@ impl KVNode {
                 .log
                 .append(self.get_current_term(), Some(log_item));
 
-            Ok(Some(p))
+            Ok(None)
         } else if self.raft_data.presumed_leader.is_some() {
             // proxy to presumed leader
             Message {
@@ -662,7 +674,6 @@ impl KVNode {
             }
             .send(output)
             .with_context(|| format!("Proxy to failed"))?;
-            log::info!("{}", format!("Proxied to leader: {}", self.raft_data.presumed_leader.as_ref().unwrap()));
             Ok(None)
         } else {
             log::info!(
@@ -681,7 +692,8 @@ impl KVNode {
         }
     }
 
-    fn advance_map_from_log(&mut self) {
+    fn advance_map_from_log(&mut self) -> Vec<(String, u32, Payload)> {
+        let mut to_send = vec![];
         while self.raft_data.last_applied < self.raft_data.commit_index {
             self.raft_data.last_applied += 1;
             let cmd = self
@@ -689,9 +701,15 @@ impl KVNode {
                 .log
                 .at(self.raft_data.last_applied as usize)
                 .unwrap();
-            // we are not leading, so we just catch up not responding. thats why we ditch the return value
-            let _ = self.apply(cmd.1.unwrap().cmd);
+
+            let log_item = cmd.1.unwrap();
+            let p = self.apply(log_item.cmd);
+
+            if self.state() == State::Leader {
+                to_send.push((log_item.from, log_item.msg_id, p))
+            }
         }
+        to_send
     }
 
     fn write(&mut self, index: u32, to: u32) -> Option<u32> {
@@ -730,10 +748,6 @@ impl KVNode {
             .with_context(|| format!("Broadcast to {}", node))?
         }
         Ok(())
-    }
-
-    fn handle_op(&mut self, cmd: Command) -> Payload {
-        self.apply(cmd)
     }
 
     fn apply(&mut self, cmd: Command) -> Payload {

@@ -117,10 +117,10 @@ impl Stateful for KVNode {
 }
 
 impl Raft for KVNode {
-    type Item = LogItem;
-    type Data = Payload;
+    type LogItem = LogItem;
+    type Packet = Payload;
 
-    fn advance_commit_index(&mut self) {
+    fn advance_commit_index(&mut self) -> Vec<(String, u32, Payload)>{
         if self.state() == State::Leader {
             let med = median(self.raft_data.match_index.values().copied().collect()).unwrap_or(0);
 
@@ -135,6 +135,7 @@ impl Raft for KVNode {
             }
         }
         self.advance_map_from_log();
+        vec![]
     }
 
     // #[inline(always)]
@@ -282,7 +283,7 @@ impl Raft for KVNode {
         prev_log_term: u32,
         entries: &Vec<(u32, Option<LogItem>)>,
         leader_commit: u32,
-    ) -> Self::Data {
+    ) -> Self::Packet {
         self.maybe_step_down(term);
         let current_term = self.get_current_term();
         let index_plus_commited = prev_log_index + 1 + entries.len() as u32;

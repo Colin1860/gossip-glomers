@@ -52,8 +52,8 @@ pub trait Stateful {
 }
 
 pub trait Raft: Stateful {
-    type Item;
-    type Data;
+    type LogItem;
+    type Packet;
 
     // Handlers
     fn request_votes(&mut self);
@@ -73,12 +73,12 @@ pub trait Raft: Stateful {
         term: u32,
         prev_log_index: u32,
         prev_log_term: u32,
-        entries: &Vec<(u32, Option<Self::Item>)>,
+        entries: &Vec<(u32, Option<Self::LogItem>)>,
         leader_commit: u32,
-    ) -> Self::Data;
+    ) -> Self::Packet;
 
     // Helpers
-    fn advance_commit_index(&mut self);
+    fn advance_commit_index(&mut self) -> Vec<(String, u32, Self::Packet)>;
 
     fn match_index(&mut self);
 
