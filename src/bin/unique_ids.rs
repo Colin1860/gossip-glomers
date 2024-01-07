@@ -1,6 +1,6 @@
-use maelstrom_convenience::{main_loop, Event, Node};
+use anyhow::Context;
+use maelstrom_convenience::{main_loop, Event, Node, Message};
 use serde::{Deserialize, Serialize};
-use std::io::{StdoutLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -16,6 +16,7 @@ enum Payload {
 struct UniqueIDNode {
     id: usize,
     node: String,
+    writer: std::sync::mpsc::Sender<Message<Payload>>
 }
 
 impl Node<(), Payload> for UniqueIDNode {
@@ -23,6 +24,7 @@ impl Node<(), Payload> for UniqueIDNode {
         _state: (),
         init: maelstrom_convenience::Init,
         _inject: std::sync::mpsc::Sender<maelstrom_convenience::Event<Payload, ()>>,
+        message_writer: std::sync::mpsc::Sender<Message<Payload>>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized,
@@ -30,29 +32,37 @@ impl Node<(), Payload> for UniqueIDNode {
         Ok(UniqueIDNode {
             id: 1,
             node: init.node_id,
+            writer: message_writer
         })
     }
 
     fn step(
         &mut self,
         input: maelstrom_convenience::Event<Payload, ()>,
-        output: &mut StdoutLock,
     ) -> anyhow::Result<()> {
         let Event::Message(input) = input else {
             panic!("got injected event when there's no event injection");
         };
 
-        let mut reply = input.into_reply(Some(&mut self.id));
+        let reply = input.into_reply(Some(&mut self.id));
         match reply.body.payload {
             Payload::Generate {} => {
                 let guid = format!("{}-{}", self.node, self.id);
-                reply.body.payload = Payload::GenerateOk { guid };
-                reply.send(&mut *output)?;
+                self.set_payload_and_send(reply, Payload::GenerateOk { guid })?;
             }
             Payload::GenerateOk { .. } => {}
         }
 
         Ok(())
+    }
+
+    #[inline(always)]
+    fn set_payload_and_send(&self,
+        mut reply: Message<Payload>,
+        new_payload: Payload,
+    ) -> anyhow::Result<()> {
+        reply.body.payload = new_payload;
+        self.writer.send(reply.clone()).context("sending to writer thread err'd")
     }
 }
 

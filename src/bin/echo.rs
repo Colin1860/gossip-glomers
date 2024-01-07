@@ -1,7 +1,6 @@
 use anyhow::Context;
-use maelstrom_convenience::{Node, Event, main_loop};
+use maelstrom_convenience::{Node, Event, main_loop, Message};
 use serde::{Deserialize, Serialize};
-use std::io::{StdoutLock, Write};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -12,7 +11,8 @@ enum Payload {
 }
 
 struct EchoNode {
-    id: usize
+    id: usize,
+    writer: std::sync::mpsc::Sender<Message<Payload>>,
 }
 
 impl Node<(), Payload> for EchoNode {
@@ -20,32 +20,43 @@ impl Node<(), Payload> for EchoNode {
         _state: (),
         _init: maelstrom_convenience::Init,
         _inject: std::sync::mpsc::Sender<maelstrom_convenience::Event<Payload, ()>>,
+        message_writer: std::sync::mpsc::Sender<Message<Payload>>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized {
-        Ok(EchoNode { id: 1 })
+        Ok(EchoNode { id: 1, writer: message_writer })
     }
 
     fn step(
         &mut self,
-        input: maelstrom_convenience::Event<Payload, ()>,
-        output: &mut StdoutLock,
+        input: maelstrom_convenience::Event<Payload, ()>
     ) -> anyhow::Result<()> {
         let Event::Message(input) = input else {
             panic!("got injected event when there's no event injection");
         };
 
-        let mut reply = input.into_reply(Some(&mut self.id));
-        match reply.body.payload {
-            Payload::Echo { echo } => {
-                reply.body.payload = Payload::EchoOk { echo };
-                serde_json::to_writer(&mut *output, &reply).context("serialize response init crash")?;
-                output.write_all(b"\n").context("write trailing new line")?;
+        let reply = input.into_reply(Some(&mut self.id));
+        let p = match reply.body.payload {
+            Payload::Echo { ref echo } => {
+                Some(Payload::EchoOk { echo: echo.to_owned() })  
             },
-            Payload::EchoOk { .. } => {},
+            Payload::EchoOk { .. } => {None},
+        };
+
+        if let Some(payload) = p {
+            self.set_payload_and_send(reply, payload)?
         }
 
         Ok(())
+    }
+
+    #[inline(always)]
+    fn set_payload_and_send(&self,
+        mut reply: Message<Payload>,
+        new_payload: Payload,
+    ) -> anyhow::Result<()> {
+        reply.body.payload = new_payload;
+        self.writer.send(reply.clone()).context("sending to writer thread err'd")
     }
 }
 

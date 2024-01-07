@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap},
-    io::StdoutLock,
+    collections::HashMap,
     time::Duration,
 };
 
@@ -56,28 +55,13 @@ struct CounterNode {
     node_id: String,
     neighbors: HashMap<String, u64>,
     sync: std::sync::mpsc::Sender<()>,
+    writer: std::sync::mpsc::Sender<Message<Payload>>,
 }
 
 impl CounterNode {
     #[inline(always)]
-    fn set_payload_and_send(
-        reply: &mut Message<Payload>,
-        new_payload: Payload,
-        output: &mut StdoutLock,
-    ) -> anyhow::Result<()> {
-        reply.body.payload = new_payload;
-        reply.send(output).context("sending broke")
-    }
-
-    #[inline(always)]
-    fn set_payload_and_send_to_kv(
-        reply: &mut Message<Payload>,
-        new_payload: Payload,
-        output: &mut StdoutLock,
-    ) -> anyhow::Result<()> {
-        reply.body.payload = new_payload;
-        reply.dst = SEQ_KV.into();
-        reply.send(output).context("sending broke")
+    fn send(&self, msg: Message<Payload>) -> anyhow::Result<()> {
+        self.writer.send(msg).context("Err'd on sending to writer thread")
     }
 
     fn calc(&mut self) -> u64 {
@@ -94,6 +78,7 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
         _state: (),
         init: maelstrom_convenience::Init,
         inject: std::sync::mpsc::Sender<Event<Payload, InjectedPayload>>,
+        message_writer: std::sync::mpsc::Sender<Message<Payload>>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized,
@@ -135,13 +120,13 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
             total_counter: 0,
             acc_delta: 0,
             sync: tx,
+            writer: message_writer,
         })
     }
 
     fn step(
         &mut self,
         input: Event<Payload, InjectedPayload>,
-        output: &mut std::io::StdoutLock,
     ) -> anyhow::Result<()> {
         eprintln!("Reading input");
         match input {
@@ -158,11 +143,8 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
                                 let read_payload = Payload::Read {
                                     key: Some(KEY.into()),
                                 };
-                                CounterNode::set_payload_and_send_to_kv(
-                                    &mut reply,
-                                    read_payload,
-                                    output,
-                                )?;
+                                payload = Some(read_payload);
+                                reply.dst = SEQ_KV.into();
                             }
                             _ => {
                                 panic!("Unhandled error");
@@ -199,7 +181,7 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
                 }
 
                 if payload.is_some() {
-                    CounterNode::set_payload_and_send(&mut reply, payload.unwrap(), output)?
+                    self.set_payload_and_send(reply, payload.unwrap())?
                 }
                 Ok(())
             }
@@ -223,7 +205,7 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
                                 payload: cas_payload,
                             },
                         };
-                        m.send(output)?
+                        self.send(m)?
                     }
                     InjectedPayload::Discover => {
                         for (key, _) in &self.neighbors {
@@ -238,7 +220,7 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
                                 },
                             };
 
-                            m.send(output)?
+                            self.send(m)?
                         }
                     }
                 }
@@ -246,6 +228,14 @@ impl Node<(), Payload, InjectedPayload> for CounterNode {
             }
             Event::EOF => self.sync.send(()).context("syncing fail"),
         }
+    }
+
+    fn set_payload_and_send(&self,
+        mut reply: Message<Payload>,
+        new_payload: Payload,
+    ) -> anyhow::Result<()> {
+        reply.body.payload = new_payload;
+        self.writer.send(reply.clone()).context("sending to writer thread err'd")
     }
 }
 

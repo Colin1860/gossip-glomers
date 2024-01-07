@@ -2,7 +2,7 @@ pub mod raft;
 
 use anyhow::Context;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::io::{BufRead, StdoutLock, Write};
+use std::{io::BufRead, io::Write};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message<Payload> {
     pub src: String,
@@ -73,24 +73,27 @@ pub trait Node<S, Payload, InjectedPayload = ()> {
         state: S,
         init: Init,
         inject: std::sync::mpsc::Sender<Event<Payload, InjectedPayload>>,
+        writer_sender: std::sync::mpsc::Sender<Message<Payload>>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
 
-    fn step(
-        &mut self,
-        input: Event<Payload, InjectedPayload>,
-        output: &mut StdoutLock,
+    fn step(&mut self, input: Event<Payload, InjectedPayload>) -> anyhow::Result<()>;
+
+    fn set_payload_and_send(&self,
+        reply: Message<Payload>,
+        new_payload: Payload,
     ) -> anyhow::Result<()>;
 }
 
 pub fn main_loop<S, N, P, IP>(init_state: S) -> anyhow::Result<()>
 where
-    P: DeserializeOwned + Send + 'static,
+    P: Serialize + DeserializeOwned + Send + 'static,
     N: Node<S, P, IP>,
     IP: Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
+    let (writer_sender, writer_receiver) = std::sync::mpsc::channel();
 
     let stdin = std::io::stdin().lock();
     let mut stdin = stdin.lines();
@@ -106,8 +109,8 @@ where
     let InitPayload::Init(init) = init_msg.body.payload else {
         panic!("first message should be init");
     };
-    let mut node: N =
-        Node::from_init(init_state, init, tx.clone()).context("node initilization failed")?;
+    let mut node: N = Node::from_init(init_state, init, tx.clone(), writer_sender.clone())
+        .context("node initilization failed")?;
 
     let reply = Message {
         src: init_msg.dst,
@@ -122,7 +125,7 @@ where
     stdout.write_all(b"\n").context("write trailing newline")?;
 
     drop(stdin);
-    let jh = std::thread::spawn(move || {
+    let read_jh = std::thread::spawn(move || {
         let stdin = std::io::stdin().lock();
         for line in stdin.lines() {
             let line = line.context("Maelstrom input from STDIN could not be read")?;
@@ -136,14 +139,28 @@ where
         Ok(())
     });
 
+    drop(stdout);
+    let write_jh = std::thread::spawn(move || {
+        let mut stdout = std::io::stdout().lock();
+        for msg in writer_receiver.into_iter() {
+            msg.send(&mut stdout)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
     for input in rx {
-        node.step(input, &mut stdout)
-            .context("Node step function failed")?;
+        node.step(input).context("Node step function failed")?;
     }
 
-    jh.join()
+    read_jh
+        .join()
         .expect("stdin thread panicked")
         .context("stdin thread err'd")?;
+
+    write_jh
+        .join()
+        .expect("writer thread panicked")
+        .context("writer thread err'd")?;
 
     Ok(())
 }

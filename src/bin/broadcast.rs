@@ -3,7 +3,6 @@ use maelstrom_convenience::{main_loop, Body, Event, Message, Node};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    io::StdoutLock,
     time::Duration,
 };
 
@@ -44,6 +43,7 @@ struct BroadcastNode {
     neighborhood: HashSet<String>,
     estimate: HashMap<String, HashSet<usize>>,
     gossip_sync: std::sync::mpsc::Sender<()>,
+    writer: std::sync::mpsc::Sender<Message<Payload>>
 }
 
 impl Node<(), Payload, InjectedPayload> for BroadcastNode {
@@ -51,6 +51,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
         _state: (),
         init: maelstrom_convenience::Init,
         inject: std::sync::mpsc::Sender<maelstrom_convenience::Event<Payload, InjectedPayload>>,
+        message_writer: std::sync::mpsc::Sender<Message<Payload>>
     ) -> anyhow::Result<Self>
     where
         Self: Sized,
@@ -82,13 +83,13 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                 .map(|nid| (nid, HashSet::new()))
                 .collect(),
             gossip_sync: tx,
+            writer: message_writer,
         })
     }
 
     fn step(
         &mut self,
         input: maelstrom_convenience::Event<Payload, InjectedPayload>,
-        output: &mut StdoutLock,
     ) -> anyhow::Result<()> {
         match input {
             Event::Message(message) => {
@@ -106,7 +107,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                     Payload::BroadcastOk | Payload::ReadOk { .. } | Payload::TopologyOk => (),
                 };
                 if payload.is_some() {
-                    Self::set_payload_and_send(&mut reply, payload.unwrap(), output)?
+                    self.set_payload_and_send(reply, payload.unwrap())?
                 }
             }
             Event::Injected(injected) => match injected {
@@ -127,7 +128,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                             .filter(|x| !known_to_n.contains(x))
                             .collect();
 
-                        Message {
+                        self.writer.send(Message {
                             src: self.node.clone(),
                             dst: String::from(n),
                             body: Body {
@@ -135,9 +136,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                                 in_reply_to: None,
                                 payload: Payload::Gossip { seen: notify_of },
                             },
-                        }
-                        .send(&mut *output)
-                        .with_context(|| format!("gossip to {}", n))?;
+                        })?;
                     }
                 }
             },
@@ -145,6 +144,15 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
         }
 
         Ok(())
+    }
+
+    #[inline(always)]
+    fn set_payload_and_send(&self,
+        mut reply: Message<Payload>,
+        new_payload: Payload,
+    ) -> anyhow::Result<()> {
+        reply.body.payload = new_payload;
+        self.writer.send(reply.clone()).context("sending to writer thread err'd")
     }
 }
 
@@ -175,16 +183,6 @@ impl BroadcastNode {
             // go in to error state, means that a node send a faulty topology
         };
         Payload::TopologyOk
-    }
-
-    #[inline(always)]
-    fn set_payload_and_send(
-        reply: &mut Message<Payload>,
-        new_payload: Payload,
-        output: &mut StdoutLock,
-    ) -> anyhow::Result<()> {
-        reply.body.payload = new_payload;
-        reply.send(output).context("sending broke")
     }
 }
 

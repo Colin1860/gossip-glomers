@@ -20,9 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use std::{
     collections::{HashMap, HashSet},
-    io::StdoutLock,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant}
 };
 
 const NANO: f32 = 1_000_000_000.0;
@@ -123,7 +122,7 @@ struct KVNode {
     nodes: HashSet<String>,
     store: HashMap<u32, u32>,
     raft_data: RaftData<LogItem>,
-    injector: std::sync::mpsc::Sender<maelstrom_convenience::Event<Payload, InjectedPayload>>,
+    writer: std::sync::mpsc::Sender<Message<Payload>>,
     comm: crossbeam::channel::Receiver<InternalCommunication>,
 }
 
@@ -199,13 +198,18 @@ impl Raft for KVNode {
     }
 
     fn request_votes(&mut self) {
-        self.raft_data.term_vote_started = 0;
         self.raft_data.votes.clear();
         self.raft_data.votes.insert(self.node.clone());
         log::info!("{}", format!("Cleared earlier votes"));
-        self.injector
-            .send(Event::Injected(InjectedPayload::Req))
-            .expect("This has to be handled");
+        let term = self.get_current_term();
+        let payload = Payload::RequestVote {
+            term,
+            candidate: self.node.clone(),
+            last_log_index: self.raft_data.log.size() as u32,
+            last_log_term: self.raft_data.log.last().0,
+        };
+        self.raft_data.term_vote_started = term;
+        self.broadcast(payload).expect("Receiver shutdown, we panic");
     }
 
     fn handle_vote_request(
@@ -370,7 +374,8 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
     fn from_init(
         _state: (),
         init: maelstrom_convenience::Init,
-        inject: std::sync::mpsc::Sender<maelstrom_convenience::Event<Payload, InjectedPayload>>,
+        _inject: std::sync::mpsc::Sender<maelstrom_convenience::Event<Payload, InjectedPayload>>,
+        writer_sender: std::sync::mpsc::Sender<Message<Payload>>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized,
@@ -441,14 +446,13 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
             },
             store: HashMap::default(),
             comm: r,
-            injector: inject.clone(),
+            writer: writer_sender,
         })
     }
 
     fn step(
         &mut self,
         input: maelstrom_convenience::Event<Payload, InjectedPayload>,
-        output: &mut StdoutLock,
     ) -> anyhow::Result<()> {
         match self.comm.try_recv() {
             Ok(InternalCommunication::RunCandidate) => {
@@ -492,7 +496,7 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                                 leader_commit: self.raft_data.commit_index,
                             };
 
-                            Message {
+                            self.writer.send(Message {
                                 src: self.node.clone(),
                                 dst: String::from(node),
                                 body: Body {
@@ -500,9 +504,7 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                                     in_reply_to: None,
                                     payload: append_payload,
                                 },
-                            }
-                            .send(&mut *output)
-                            .with_context(|| format!("AppendEntries to {}", &node))?;
+                            })?
                         }
                     }
                     if replicated {
@@ -517,19 +519,19 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
             Event::Message(message) => {
                 let received_id: Option<usize> = message.body.id;
                 let src = message.src.clone();
-                let mut reply = message.into_reply(Some(&mut self.id));
+                let reply = message.into_reply(Some(&mut self.id));
                 let new_payload = match reply.body.payload {
                     Payload::Cas { key, from, to } => {
                         let cmd = Command::Cas { key, from, to };
-                        self.handle_kv(cmd, src.to_string(), received_id, output)?
+                        self.handle_kv(cmd, src.to_string(), received_id)?
                     }
                     Payload::Read { key } => {
                         let cmd = Command::Read { key };
-                        self.handle_kv(cmd, src.to_string(), received_id, output)?
+                        self.handle_kv(cmd, src.to_string(), received_id)?
                     }
                     Payload::Write { key, value } => {
                         let cmd = Command::Write { key, value };
-                        self.handle_kv(cmd, src.to_string(), received_id, output)?
+                        self.handle_kv(cmd, src.to_string(), received_id)?
                     }
                     Payload::RequestVoteOk { term, vote_granted } => {
                         self.handle_vote(src.to_string(), term, vote_granted);
@@ -595,18 +597,17 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                                     format!("Size of reply collection: {}", to_reply.len())
                                 );
                                 to_reply.into_iter().for_each(|(to, in_reply_to, p)| {
-                                    Message {
-                                        src: self.node.clone(),
-                                        dst: to,
-                                        body: Body {
-                                            id: Some(self.id),
-                                            in_reply_to: Some(in_reply_to as usize),
-                                            payload: p,
-                                        },
-                                    }
-                                    .send(output)
-                                    .with_context(|| format!("Reply from log failed"))
-                                    .expect("Replying in closure for each failed");
+                                    self.writer
+                                        .send(Message {
+                                            src: self.node.clone(),
+                                            dst: to,
+                                            body: Body {
+                                                id: Some(self.id),
+                                                in_reply_to: Some(in_reply_to as usize),
+                                                payload: p,
+                                            },
+                                        })
+                                        .expect("Replying in closure for each failed");
                                     self.id += 1;
                                 })
                             } else {
@@ -619,26 +620,25 @@ impl Node<(), Payload, InjectedPayload> for KVNode {
                     _ => None,
                 };
                 if let Some(new_payload) = new_payload {
-                    KVNode::set_payload_and_send(&mut reply, new_payload, output)?
+                    self.set_payload_and_send(reply, new_payload)?
                 }
             }
-            Event::Injected(injected) => match injected {
-                InjectedPayload::Req => {
-                    let term = self.get_current_term();
-                    let payload = Payload::RequestVote {
-                        term,
-                        candidate: self.node.clone(),
-                        last_log_index: self.raft_data.log.size() as u32,
-                        last_log_term: self.raft_data.log.last().0,
-                    };
-                    self.raft_data.term_vote_started = term;
-                    self.broadcast(payload, output)?
-                }
-            },
+            Event::Injected(_) => {}
             Event::EOF => {}
         }
 
         Ok(())
+    }
+
+    fn set_payload_and_send(
+        &self,
+        mut reply: Message<Payload>,
+        new_payload: Payload,
+    ) -> anyhow::Result<()> {
+        reply.body.payload = new_payload;
+        self.writer
+            .send(reply)
+            .context("Sending to writer thread errd")
     }
 }
 
@@ -648,7 +648,6 @@ impl KVNode {
         kv_cmd: Command,
         from: String,
         id: Option<usize>,
-        output: &mut StdoutLock,
     ) -> anyhow::Result<Option<Payload>> {
         if self.state() == State::Leader {
             let log_item = LogItem {
@@ -663,7 +662,7 @@ impl KVNode {
             Ok(None)
         } else if self.raft_data.presumed_leader.is_some() {
             // proxy to presumed leader
-            Message {
+            self.writer.send(Message {
                 src: from.clone(),
                 dst: self.raft_data.presumed_leader.as_ref().unwrap().clone(),
                 body: Body {
@@ -671,9 +670,7 @@ impl KVNode {
                     in_reply_to: Some(1860),
                     payload: Payload::from(kv_cmd),
                 },
-            }
-            .send(output)
-            .with_context(|| format!("Proxy to failed"))?;
+            })?;
             Ok(None)
         } else {
             log::info!(
@@ -733,9 +730,9 @@ impl KVNode {
         }
     }
 
-    fn broadcast(&self, payload: Payload, output: &mut StdoutLock) -> anyhow::Result<()> {
+    fn broadcast(&self, payload: Payload) -> anyhow::Result<()> {
         for node in &self.nodes {
-            Message {
+            self.writer.send(Message {
                 src: self.node.clone(),
                 dst: String::from(node),
                 body: Body {
@@ -743,9 +740,7 @@ impl KVNode {
                     in_reply_to: None,
                     payload: payload.clone(),
                 },
-            }
-            .send(&mut *output)
-            .with_context(|| format!("Broadcast to {}", node))?
+            })?
         }
         Ok(())
     }
@@ -771,15 +766,6 @@ impl KVNode {
                     })
             }
         }
-    }
-
-    fn set_payload_and_send(
-        reply: &mut Message<Payload>,
-        new_payload: Payload,
-        output: &mut StdoutLock,
-    ) -> anyhow::Result<()> {
-        reply.body.payload = new_payload;
-        reply.send(output).context("sending broke")
     }
 }
 

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::StdoutLock};
+use std::collections::HashMap;
 
 use anyhow::Context;
 use maelstrom_convenience::{main_loop, Event, Message, Node};
@@ -91,18 +91,7 @@ pub struct KafkaNode {
     id: usize,
     storage: Storage,
     sync: std::sync::mpsc::Sender<()>,
-}
-
-impl KafkaNode {
-    #[inline(always)]
-    fn set_payload_and_send(
-        reply: &mut Message<Payload>,
-        new_payload: Payload,
-        output: &mut StdoutLock,
-    ) -> anyhow::Result<()> {
-        reply.body.payload = new_payload;
-        reply.send(output).context("sending broke")
-    }
+    writer: std::sync::mpsc::Sender<Message<Payload>>,
 }
 
 impl Node<(), Payload, InjectedPayload> for KafkaNode {
@@ -110,6 +99,7 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         _state: (),
         _init: maelstrom_convenience::Init,
         _inject: std::sync::mpsc::Sender<Event<Payload, InjectedPayload>>,
+        message_writer: std::sync::mpsc::Sender<Message<Payload>>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized,
@@ -126,17 +116,17 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
                 logs: HashMap::new(),
             },
             sync: tx,
+            writer: message_writer,
         })
     }
 
     fn step(
         &mut self,
-        input: Event<Payload, InjectedPayload>,
-        output: &mut std::io::StdoutLock,
+        input: Event<Payload, InjectedPayload>
     ) -> anyhow::Result<()> {
         match input {
             Event::Message(message) => {
-                let mut reply = message.into_reply(Some(&mut self.id));
+                let reply = message.into_reply(Some(&mut self.id));
                 let mut payload = None;
                 match reply.body.payload {
                     Payload::Error { .. } => todo!(),
@@ -213,13 +203,21 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
                     Payload::ListCommittedOffsetsOk { .. } => {}
                 }
                 if payload.is_some() {
-                    KafkaNode::set_payload_and_send(&mut reply, payload.unwrap(), output)?
+                    self.set_payload_and_send(reply, payload.unwrap())?
                 }
                 Ok(())
             }
             Event::Injected(message) => match message {},
             Event::EOF => self.sync.send(()).context("syncing fail"),
         }
+    }
+
+    fn set_payload_and_send(&self,
+        mut reply: Message<Payload>,
+        new_payload: Payload,
+    ) -> anyhow::Result<()> {
+        reply.body.payload = new_payload;
+        self.writer.send(reply.clone()).context("sending to writer thread err'd")
     }
 }
 
